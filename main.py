@@ -772,7 +772,10 @@ async def get_live():
             "op": matched_bus.get("op", matched_bus.get("operator", data.get("operator"))),
             "route": matched_bus.get("route", ""),
             "time": matched_bus.get("time", matched_bus.get("departureTime", "")),
-            "arrivalTime": matched_bus.get("arrivalTime", "")
+            "arrivalTime": matched_bus.get("arrivalTime", ""),
+            "intermediateStops": matched_bus.get("intermediateStops", []),
+            "stopTimes": matched_bus.get("stopTimes", []),
+            "type": matched_bus.get("type", "")
         }
 
     return formatted
