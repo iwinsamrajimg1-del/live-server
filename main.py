@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import firebase_admin
 from firebase_admin import credentials, db
 from datetime import datetime
+from zoneinfo import ZoneInfo
 import asyncio
 import os
 import websockets
@@ -230,15 +231,17 @@ def extract_service_no_from_url(url):
     except:
         return None
 
+IST = ZoneInfo("Asia/Kolkata")
+
 def now_time():
-    return datetime.now().strftime(
-        "%I:%M %p"
-    )
+    return datetime.now(
+        IST
+    ).strftime("%I:%M %p")
 
 def current_date():
-    return datetime.now().strftime(
-        "%Y-%m-%d"
-    )
+    return datetime.now(
+        IST
+    ).strftime("%Y-%m-%d")
 
 def calculate_delay(
     scheduled_time,
@@ -473,6 +476,13 @@ async def process_stop_detection(
             )
         )
 
+        print(
+            f"[TIME DEBUG] "
+            f"Stop={stop_name} "
+            f"Scheduled={scheduled_time} "
+            f"Actual={actual_time}"
+        )
+
         actual_ref.set({
             "scheduled":
             scheduled_time,
@@ -488,7 +498,7 @@ async def process_stop_detection(
 
             "recordedAt":
             int(
-                datetime.now()
+                datetime.now(IST)
                 .timestamp()
             )
         })
