@@ -64,11 +64,7 @@ def auto_fill_previous_stops(
     auto-fill previous pending stops.
     """
 
-    actual_ref = db.reference(
-        f"journeys/{bus_id}/{journey_key}/actualTimes"
-    )
-
-    existing = actual_ref.get() or {}
+    existing = recorded_stops.get(bus_id, set())
 
     for i in range(current_index):
 
@@ -92,14 +88,17 @@ def auto_fill_previous_stops(
             ""
         )
 
-        actual_ref.child(
-            stop_key
+        db.reference(
+            f"journeys/{bus_id}/{journey_key}/actualTimes/{stop_key}"
         ).set({
             "actual": scheduled,
             "scheduled": scheduled,
             "delayMinutes": 0,
             "status": "Passed"
         })
+        
+        if bus_id in recorded_stops:
+            recorded_stops[bus_id].add(stop_key)
 
         print(
             f"[AUTO FILL] "
@@ -114,6 +113,9 @@ def auto_fill_previous_stops(
 # Store in-memory live coordinates and statuses
 # Structure: { service_no: { lat, lng, serviceNo, vehicleNo, operator, lastSeenTime, status } }
 live_buses = {}
+recorded_stops = {}
+buses_cache = {}
+route_points_cache = {}
 
 # Active tracking WebSocket task registry
 # Structure: { service_no: asyncio.Task }
@@ -270,8 +272,7 @@ def update_journey_status():
     Updates status of active journeys and handles 24h cleanup.
     """
     now = datetime.now(IST)
-    buses_ref = db.reference("buses")
-    buses = buses_ref.get() or {}
+    buses = buses_cache or db.reference("buses").get() or {}
     
     active_ref = db.reference("activeJourneys")
     active_journeys = active_ref.get() or {}
@@ -339,10 +340,11 @@ def update_journey_status():
                 new_status = "COMPLETED"
                 
             if new_status != status:
-                # Update in activeJourneys
-                active_ref.child(bus_id).update({"status": new_status})
+                # Update in activeJourneys ONLY if it changed
+                payload = {"status": new_status}
                 if new_status == "COMPLETED":
-                    active_ref.child(bus_id).update({"completedAt": int(time.time())})
+                    payload["completedAt"] = int(time.time())
+                active_ref.child(bus_id).update(payload)
                     
                 # Update in journeys metadata
                 db.reference(f"journeys/{bus_id}/{journey_key}/metadata").update({"status": new_status})
@@ -374,16 +376,23 @@ def init_journey_metadata(bus_id, journey_date, departure_time_str, matched_bus=
             except Exception as e:
                 print(f"[INIT STATUS ERROR] {e}")
                 
-    # Update activeJourneys
-    active_payload = {
-        "journeyDate": journey_date,
-        "journeyKey": journey_key,
-        "status": status
-    }
-    if status == "COMPLETED":
-        active_payload["completedAt"] = int(time.time())
-        
-    db.reference(f"activeJourneys/{bus_id}").update(active_payload)
+    # Update activeJourneys ONLY if key or status changed
+    active_ref = db.reference(f"activeJourneys/{bus_id}")
+    active_existing = active_ref.get()
+    write_active = True
+    if isinstance(active_existing, dict):
+        if active_existing.get("journeyKey") == journey_key and active_existing.get("status") == status:
+            write_active = False
+            
+    if write_active:
+        active_payload = {
+            "journeyDate": journey_date,
+            "journeyKey": journey_key,
+            "status": status
+        }
+        if status == "COMPLETED":
+            active_payload["completedAt"] = int(time.time())
+        active_ref.update(active_payload)
     
     # Check if metadata exists under journeys/{bus_id}/{journey_key}/metadata
     meta_ref = db.reference(f"journeys/{bus_id}/{journey_key}/metadata")
@@ -393,8 +402,7 @@ def init_journey_metadata(bus_id, journey_date, departure_time_str, matched_bus=
             "departureTime": departure_time_str,
             "serviceNo": bus_id,
             "status": status,
-            "schemaVersion": 2,
-            "lastGpsUpdate": int(time.time())
+            "schemaVersion": 2
         })
     return journey_key
 
@@ -478,14 +486,7 @@ async def process_stop_detection(
     lng,
     journey_date
 ):
-    buses_ref = db.reference(
-        "buses"
-    )
-
-    buses = (
-        buses_ref.get()
-        or {}
-    )
+    buses = buses_cache or db.reference("buses").get() or {}
 
     matched_bus = None
 
@@ -515,13 +516,23 @@ async def process_stop_detection(
         )
         return
 
-    departure_time_str = matched_bus.get("time") or matched_bus.get("departureTime", "")
-    journey_key = init_journey_metadata(bus_id, journey_date, departure_time_str, matched_bus)
-    
-    # Update lastGpsUpdate in journey metadata
-    db.reference(f"journeys/{bus_id}/{journey_key}/metadata").update({
-        "lastGpsUpdate": int(time.time())
-    })
+    # Try retrieving journeyKey from in-memory cache first
+    journey_key = None
+    if bus_id in live_buses:
+        journey_key = live_buses[bus_id].get("journeyKey")
+        
+    if not journey_key:
+        departure_time_str = matched_bus.get("time") or matched_bus.get("departureTime", "")
+        journey_key = init_journey_metadata(bus_id, journey_date, departure_time_str, matched_bus)
+
+    # Initialize recorded stops cache for this bus from Firebase if not done yet
+    if bus_id not in recorded_stops:
+        try:
+            actual_times_existing = db.reference(f"journeys/{bus_id}/{journey_key}/actualTimes").get() or {}
+            recorded_stops[bus_id] = set(actual_times_existing.keys())
+        except Exception as e:
+            print(f"[CACHE STOP ERROR] {e}")
+            recorded_stops[bus_id] = set()
 
     route = matched_bus.get(
         "route",
@@ -534,14 +545,15 @@ async def process_stop_detection(
         .replace(" ", "_")
     )
 
-    route_points_ref = db.reference(
-        f"routePoints/{route_key}"
-    )
-
-    route_points = (
-        route_points_ref.get()
-        or []
-    )
+    if route_key not in route_points_cache:
+        route_points_ref = db.reference(
+            f"routePoints/{route_key}"
+        )
+        route_points_cache[route_key] = (
+            route_points_ref.get()
+            or []
+        )
+    route_points = route_points_cache[route_key]
 
     print(
         f"[ROUTE POINTS] "
@@ -595,17 +607,9 @@ async def process_stop_detection(
             .replace(" ", "_")
         )
 
-        actual_ref = db.reference(
-            f"journeys/{bus_id}/{journey_key}/actualTimes/{stop_key}"
-        )
-
-        exists = (
-            actual_ref.get()
-        )
-
-        if exists:
+        if stop_key in recorded_stops[bus_id]:
             print(
-                "[SKIP] already recorded"
+                "[SKIP] already recorded (RAM cache)"
             )
             continue
 
@@ -644,6 +648,9 @@ async def process_stop_detection(
             f"Actual={actual_time}"
         )
 
+        actual_ref = db.reference(
+            f"journeys/{bus_id}/{journey_key}/actualTimes/{stop_key}"
+        )
         actual_ref.set({
             "scheduled":
             scheduled_time,
@@ -663,6 +670,7 @@ async def process_stop_detection(
                 .timestamp()
             )
         })
+        recorded_stops[bus_id].add(stop_key)
 
         print(
             f"[STOP ARRIVED] "
@@ -677,19 +685,26 @@ async def process_stop_detection(
 
         # Actual Arrival Auto-Fill if final stop reached
         if index == len(route_points) - 1:
-            actual_arrival_dt = datetime.now(IST).strftime("%Y-%m-%d %I:%M %p")
-            actual_arrival_ts = int(time.time())
-            print(f"[FINAL STOP REACHED] Recording actual arrival: {actual_arrival_dt}")
-            
-            db.reference(f"journeys/{bus_id}/{journey_key}/metadata").update({
-                "actualArrival": actual_arrival_dt,
-                "actualArrivalTimestamp": actual_arrival_ts,
-                "status": "COMPLETED"
-            })
-            db.reference(f"activeJourneys/{bus_id}").update({
-                "status": "COMPLETED",
-                "completedAt": actual_arrival_ts
-            })
+            meta_ref = db.reference(f"journeys/{bus_id}/{journey_key}/metadata")
+            meta_existing = meta_ref.get() or {}
+            if "actualArrival" not in meta_existing:
+                actual_arrival_dt = datetime.now(IST).strftime("%Y-%m-%d %I:%M %p")
+                actual_arrival_ts = int(time.time())
+                print(f"[FINAL STOP REACHED] Recording actual arrival: {actual_arrival_dt}")
+                
+                meta_ref.update({
+                    "actualArrival": actual_arrival_dt,
+                    "actualArrivalTimestamp": actual_arrival_ts,
+                    "status": "COMPLETED"
+                })
+                
+                active_ref = db.reference(f"activeJourneys/{bus_id}")
+                active_existing = active_ref.get() or {}
+                if active_existing.get("status") != "COMPLETED":
+                    active_ref.update({
+                        "status": "COMPLETED",
+                        "completedAt": actual_arrival_ts
+                    })
 
 # ======================================================
 # WEBSOCKET LISTENER & STALE CHECKER
@@ -706,9 +721,9 @@ async def websocket_listener(service_no, ws_url, ws_port, doj, default_vehicle_n
     print(f"[WEBSOCKET] Starting connection loop for {service_no} => {endpoint}")
     
     # Initialize active journey metadata on connect
+    journey_key = None
     try:
-        buses_ref = db.reference("buses")
-        buses = buses_ref.get() or {}
+        buses = buses_cache or db.reference("buses").get() or {}
         matched_bus = None
         for _, bus in buses.items():
             link = bus.get("link")
@@ -728,7 +743,11 @@ async def websocket_listener(service_no, ws_url, ws_port, doj, default_vehicle_n
         departure_time_str = ""
         if matched_bus:
             departure_time_str = matched_bus.get("time") or matched_bus.get("departureTime", "")
-        init_journey_metadata(service_no, doj, departure_time_str, matched_bus)
+        journey_key = init_journey_metadata(service_no, doj, departure_time_str, matched_bus)
+        
+        if service_no not in live_buses:
+            live_buses[service_no] = {}
+        live_buses[service_no]["journeyKey"] = journey_key
     except Exception as e:
         print(f"[WEBSOCKET INIT ERROR] {e}")
 
@@ -764,7 +783,9 @@ async def websocket_listener(service_no, ws_url, ws_port, doj, default_vehicle_n
                                 "vehicleNo": veh_no,
                                 "operator": op_name,
                                 "lastSeenTime": datetime.now(),
-                                "status": "live"
+                                "last_seen": time.time(),
+                                "status": "live",
+                                "journeyKey": journey_key
                             }
                             
                             print(f"[MARKER UPDATE] GPS update: {service_no} => {lat}, {lng}")
@@ -783,19 +804,22 @@ async def websocket_listener(service_no, ws_url, ws_port, doj, default_vehicle_n
             await asyncio.sleep(5)
 
 async def stale_bus_checker():
+    last_status_check = 0
     while True:
         try:
-            update_journey_status()
-            now = datetime.now()
+            now = time.time()
+            if now - last_status_check >= 300:
+                update_journey_status()
+                last_status_check = now
             remove_buses = []
 
             for bus_id, bus_data in list(live_buses.items()):
-                last_seen = bus_data.get("lastSeenTime")
+                last_seen = bus_data.get("last_seen")
                 if not last_seen:
-                    bus_data["lastSeenTime"] = now
+                    bus_data["last_seen"] = now
                     continue
 
-                inactive_time = (now - last_seen).total_seconds()
+                inactive_time = now - last_seen
 
                 if inactive_time > 300:
                     print(
@@ -825,6 +849,12 @@ async def stale_bus_checker():
 
                 # remove RAM data
                 live_buses.pop(
+                    bus_id,
+                    None
+                )
+
+                # prevent memory leak in recorded_stops
+                recorded_stops.pop(
                     bus_id,
                     None
                 )
@@ -864,8 +894,10 @@ def start_firebase_bus_listener():
 
     def on_change(event):
         try:
+            global buses_cache
             print("[FIREBASE] Bus update detected")
             buses = ref.get() or {}
+            buses_cache = buses
 
             active_configured_services = set()
             for bus_key, bus in buses.items():
@@ -972,8 +1004,7 @@ async def get_live():
     formatted = {}
     now = datetime.now()
     
-    buses_ref = db.reference("buses")
-    configured_buses = buses_ref.get() or {}
+    configured_buses = buses_cache or db.reference("buses").get() or {}
 
     for bus_id, data in live_buses.items():
         last_seen = data.get("lastSeenTime")
