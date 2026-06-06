@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import firebase_admin
 from firebase_admin import credentials, db
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import asyncio
 import os
@@ -55,7 +55,8 @@ print("[OK] Firebase Connected")
 def auto_fill_previous_stops(
     bus_id,
     route_points,
-    current_index
+    current_index,
+    journey_key
 ):
     """
     If backend started late and bus
@@ -63,12 +64,8 @@ def auto_fill_previous_stops(
     auto-fill previous pending stops.
     """
 
-    today = datetime.now().strftime(
-        "%Y-%m-%d"
-    )
-
     actual_ref = db.reference(
-        f"actualTimes/{bus_id}/{today}"
+        f"journeys/{bus_id}/{journey_key}/actualTimes"
     )
 
     existing = actual_ref.get() or {}
@@ -243,6 +240,164 @@ def current_date():
         IST
     ).strftime("%Y-%m-%d")
 
+STOP_RADIUS_METERS = 400
+
+def format_time_24hr(time_str):
+    if not time_str:
+        return "0000"
+    time_str = re.sub(r'\s*([AP]M)', r' \1', str(time_str).strip().upper())
+    if re.match(r'^\d:\d\d', time_str):
+        time_str = '0' + time_str
+    try:
+        dt = datetime.strptime(time_str, "%I:%M %p")
+        return dt.strftime("%H%M")
+    except Exception as e:
+        print(f"[FORMAT TIME 24HR ERROR] {e} for {time_str}")
+        return "0000"
+
+def parse_datetime(date_str, time_str):
+    time_str = re.sub(r'\s*([AP]M)', r' \1', str(time_str).strip().upper())
+    if re.match(r'^\d:\d\d', time_str):
+        time_str = '0' + time_str
+    dt = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %I:%M %p")
+    return dt.replace(tzinfo=IST)
+
+def get_journey_ref(bus_id, journey_key):
+    return db.reference(f"journeys/{bus_id}/{journey_key}")
+
+def update_journey_status():
+    """
+    Updates status of active journeys and handles 24h cleanup.
+    """
+    now = datetime.now(IST)
+    buses_ref = db.reference("buses")
+    buses = buses_ref.get() or {}
+    
+    active_ref = db.reference("activeJourneys")
+    active_journeys = active_ref.get() or {}
+    
+    for bus_id, active_info in active_journeys.items():
+        if not isinstance(active_info, dict):
+            continue
+        journey_date = active_info.get("journeyDate")
+        journey_key = active_info.get("journeyKey")
+        status = active_info.get("status")
+        completed_at = active_info.get("completedAt")
+        
+        if not journey_date or not journey_key:
+            continue
+            
+        # 24 hours cleanup for COMPLETED journeys
+        if status == "COMPLETED" and completed_at:
+            if (time.time() - completed_at) > 86400:
+                print(f"[STATUS CLEANUP] Removing completed journey {bus_id} ({journey_key})")
+                db.reference(f"activeJourneys/{bus_id}").delete()
+                continue
+                
+        # Find matching configured bus to calculate status
+        matched_bus = None
+        for _, bus in buses.items():
+            link = bus.get("link")
+            if link:
+                extracted = extract_service_no_from_url(link)
+                if extracted and extracted.upper() == bus_id.upper():
+                    matched_bus = bus
+                    break
+            operator = (
+                bus.get("op", "")
+                .split()[0]
+                .upper()
+            )
+            if operator and operator in bus_id.upper():
+                matched_bus = bus
+                break
+                
+        if not matched_bus:
+            continue
+            
+        departure_time_str = matched_bus.get("time") or matched_bus.get("departureTime")
+        arrival_time_str = matched_bus.get("arrivalTime")
+        
+        if not departure_time_str or not arrival_time_str:
+            continue
+            
+        try:
+            departure_dt = parse_datetime(journey_date, departure_time_str)
+            arrival_dt = parse_datetime(journey_date, arrival_time_str)
+            
+            if arrival_dt < departure_dt:
+                arrival_dt += timedelta(days=1)
+                
+            # If status is already marked COMPLETED (e.g. by final stop arrival), we keep it COMPLETED
+            if status == "COMPLETED":
+                new_status = "COMPLETED"
+            elif now < departure_dt:
+                new_status = "WAITING"
+            elif departure_dt <= now <= (arrival_dt + timedelta(hours=3)):
+                new_status = "LIVE"
+            else:
+                new_status = "COMPLETED"
+                
+            if new_status != status:
+                # Update in activeJourneys
+                active_ref.child(bus_id).update({"status": new_status})
+                if new_status == "COMPLETED":
+                    active_ref.child(bus_id).update({"completedAt": int(time.time())})
+                    
+                # Update in journeys metadata
+                db.reference(f"journeys/{bus_id}/{journey_key}/metadata").update({"status": new_status})
+                print(f"[STATUS UPDATE] {bus_id} ({journey_key}) -> {new_status}")
+        except Exception as e:
+            print(f"[STATUS UPDATE ERROR] For {bus_id} on {journey_date}: {e}")
+
+def init_journey_metadata(bus_id, journey_date, departure_time_str, matched_bus=None):
+    journey_key = f"{journey_date}_{format_time_24hr(departure_time_str)}"
+    
+    # Calculate status
+    status = "LIVE"
+    if matched_bus:
+        departure_time_str = matched_bus.get("time") or matched_bus.get("departureTime") or departure_time_str
+        arrival_time_str = matched_bus.get("arrivalTime")
+        if departure_time_str and arrival_time_str:
+            try:
+                now = datetime.now(IST)
+                departure_dt = parse_datetime(journey_date, departure_time_str)
+                arrival_dt = parse_datetime(journey_date, arrival_time_str)
+                if arrival_dt < departure_dt:
+                    arrival_dt += timedelta(days=1)
+                if now < departure_dt:
+                    status = "WAITING"
+                elif departure_dt <= now <= (arrival_dt + timedelta(hours=3)):
+                    status = "LIVE"
+                else:
+                    status = "COMPLETED"
+            except Exception as e:
+                print(f"[INIT STATUS ERROR] {e}")
+                
+    # Update activeJourneys
+    active_payload = {
+        "journeyDate": journey_date,
+        "journeyKey": journey_key,
+        "status": status
+    }
+    if status == "COMPLETED":
+        active_payload["completedAt"] = int(time.time())
+        
+    db.reference(f"activeJourneys/{bus_id}").update(active_payload)
+    
+    # Check if metadata exists under journeys/{bus_id}/{journey_key}/metadata
+    meta_ref = db.reference(f"journeys/{bus_id}/{journey_key}/metadata")
+    if not meta_ref.get():
+        meta_ref.set({
+            "departureDate": journey_date,
+            "departureTime": departure_time_str,
+            "serviceNo": bus_id,
+            "status": status,
+            "schemaVersion": 2,
+            "lastGpsUpdate": int(time.time())
+        })
+    return journey_key
+
 def calculate_delay(
     scheduled_time,
     actual_time
@@ -320,7 +475,8 @@ def calculate_delay(
 async def process_stop_detection(
     bus_id,
     lat,
-    lng
+    lng,
+    journey_date
 ):
     buses_ref = db.reference(
         "buses"
@@ -358,6 +514,14 @@ async def process_stop_detection(
             f"No matching bus for {bus_id}"
         )
         return
+
+    departure_time_str = matched_bus.get("time") or matched_bus.get("departureTime", "")
+    journey_key = init_journey_metadata(bus_id, journey_date, departure_time_str, matched_bus)
+    
+    # Update lastGpsUpdate in journey metadata
+    db.reference(f"journeys/{bus_id}/{journey_key}/metadata").update({
+        "lastGpsUpdate": int(time.time())
+    })
 
     route = matched_bus.get(
         "route",
@@ -405,7 +569,7 @@ async def process_stop_detection(
                 lng,
                 stop_lat,
                 stop_lng,
-                100
+                STOP_RADIUS_METERS
             )
         )
 
@@ -422,20 +586,17 @@ async def process_stop_detection(
         auto_fill_previous_stops(
             bus_id,
             route_points,
-            index
+            index,
+            journey_key
         )
 
-        date = current_date()
         stop_key = (
             stop_name
             .replace(" ", "_")
         )
 
         actual_ref = db.reference(
-            f"actualTimes/"
-            f"{bus_id}/"
-            f"{date}/"
-            f"{stop_key}"
+            f"journeys/{bus_id}/{journey_key}/actualTimes/{stop_key}"
         )
 
         exists = (
@@ -514,6 +675,22 @@ async def process_stop_detection(
             f"{status}"
         )
 
+        # Actual Arrival Auto-Fill if final stop reached
+        if index == len(route_points) - 1:
+            actual_arrival_dt = datetime.now(IST).strftime("%Y-%m-%d %I:%M %p")
+            actual_arrival_ts = int(time.time())
+            print(f"[FINAL STOP REACHED] Recording actual arrival: {actual_arrival_dt}")
+            
+            db.reference(f"journeys/{bus_id}/{journey_key}/metadata").update({
+                "actualArrival": actual_arrival_dt,
+                "actualArrivalTimestamp": actual_arrival_ts,
+                "status": "COMPLETED"
+            })
+            db.reference(f"activeJourneys/{bus_id}").update({
+                "status": "COMPLETED",
+                "completedAt": actual_arrival_ts
+            })
+
 # ======================================================
 # WEBSOCKET LISTENER & STALE CHECKER
 # ======================================================
@@ -528,6 +705,33 @@ async def websocket_listener(service_no, ws_url, ws_port, doj, default_vehicle_n
 
     print(f"[WEBSOCKET] Starting connection loop for {service_no} => {endpoint}")
     
+    # Initialize active journey metadata on connect
+    try:
+        buses_ref = db.reference("buses")
+        buses = buses_ref.get() or {}
+        matched_bus = None
+        for _, bus in buses.items():
+            link = bus.get("link")
+            if link:
+                extracted = extract_service_no_from_url(link)
+                if extracted and extracted.upper() == service_no.upper():
+                    matched_bus = bus
+                    break
+            operator = (
+                bus.get("op", "")
+                .split()[0]
+                .upper()
+            )
+            if operator and operator in service_no.upper():
+                matched_bus = bus
+                break
+        departure_time_str = ""
+        if matched_bus:
+            departure_time_str = matched_bus.get("time") or matched_bus.get("departureTime", "")
+        init_journey_metadata(service_no, doj, departure_time_str, matched_bus)
+    except Exception as e:
+        print(f"[WEBSOCKET INIT ERROR] {e}")
+
     while True:
         try:
             async with websockets.connect(endpoint, ping_interval=30, ping_timeout=10) as websocket:
@@ -564,7 +768,7 @@ async def websocket_listener(service_no, ws_url, ws_port, doj, default_vehicle_n
                             }
                             
                             print(f"[MARKER UPDATE] GPS update: {service_no} => {lat}, {lng}")
-                            await process_stop_detection(service_no, float(lat), float(lng))
+                            await process_stop_detection(service_no, float(lat), float(lng), doj)
                             
                     except Exception as e:
                         print(f"[WEBSOCKET ERROR] Message parsing failed: {e}")
@@ -581,6 +785,7 @@ async def websocket_listener(service_no, ws_url, ws_port, doj, default_vehicle_n
 async def stale_bus_checker():
     while True:
         try:
+            update_journey_status()
             now = datetime.now()
             remove_buses = []
 
@@ -686,12 +891,23 @@ def start_firebase_bus_listener():
                 page_data = fetch_and_parse_tracking_page(tracking_link)
                 
                 if page_data:
+                    # Recover DOJ if activeJourneys exists
+                    try:
+                        active_info = db.reference(f"activeJourneys/{service_no}").get()
+                    except Exception as e:
+                        print(f"[RECOVERY ERROR] {e}")
+                        active_info = None
+                    doj = page_data["doj"]
+                    if active_info and isinstance(active_info, dict) and active_info.get("journeyDate"):
+                        doj = active_info["journeyDate"]
+                        print(f"[RECOVERY] Recovered active journey date {doj} for {service_no}")
+
                     future = asyncio.run_coroutine_threadsafe(
                         websocket_listener(
                             service_no=page_data["serviceNo"] or service_no,
                             ws_url=page_data["ws_url"],
                             ws_port=page_data["ws_port"],
-                            doj=page_data["doj"],
+                            doj=doj,
                             default_vehicle_no=page_data["vehicleNo"],
                             op_name=page_data["operator"] or bus.get("op", "")
                         ),
@@ -791,9 +1007,85 @@ async def get_live():
     return formatted
 
 @app.get("/api/actual-times")
-async def actual_times():
-    ref = db.reference("actualTimes")
-    return ref.get() or {}
+async def actual_times(bus_id: str = None):
+    if bus_id:
+        new_data = db.reference(f"journeys/{bus_id}").get()
+        if new_data and isinstance(new_data, dict):
+            # Format the output to look like { journey_key: actualTimes }
+            formatted = {}
+            for j_key, j_val in new_data.items():
+                if isinstance(j_val, dict) and "actualTimes" in j_val:
+                    formatted[j_key] = j_val["actualTimes"]
+            if formatted:
+                return formatted
+                
+        old_data = db.reference(f"actualTimes/{bus_id}").get()
+        return old_data or {}
+
+    # Unified fallback if no bus_id: merge journeys and old actualTimes
+    old_actual = db.reference("actualTimes").get() or {}
+    journeys = db.reference("journeys").get() or {}
+    
+    merged = {}
+    for b_id, dates in old_actual.items():
+        if isinstance(dates, dict):
+            merged[b_id] = {}
+            for d, stops in dates.items():
+                if isinstance(stops, dict):
+                    merged[b_id][d] = dict(stops)
+                
+    for b_id, journey_keys in journeys.items():
+        if not isinstance(journey_keys, dict):
+            continue
+        if b_id not in merged:
+            merged[b_id] = {}
+        for j_key, j_val in journey_keys.items():
+            if isinstance(j_val, dict) and "actualTimes" in j_val:
+                merged[b_id][j_key] = j_val["actualTimes"]
+                
+    return merged
+
+@app.get("/api/journey-status")
+async def journey_status(bus_id: str):
+    # check activeJourneys first
+    active_ref = db.reference(f"activeJourneys/{bus_id}")
+    active = active_ref.get()
+    if active and isinstance(active, dict) and active.get("journeyKey"):
+        journey_key = active["journeyKey"]
+        status = active.get("status", "LIVE")
+        journey_date = active.get("journeyDate")
+        
+        meta_ref = db.reference(f"journeys/{bus_id}/{journey_key}/metadata")
+        meta = meta_ref.get() or {}
+        return {
+            "busId": bus_id,
+            "journeyKey": journey_key,
+            "departureDate": journey_date,
+            "status": status,
+            "actualArrival": meta.get("actualArrival")
+        }
+        
+    # Fallback: if not in activeJourneys, look at the latest journey in journeys/{bus_id}
+    journeys_ref = db.reference(f"journeys/{bus_id}")
+    journeys = journeys_ref.get()
+    if journeys and isinstance(journeys, dict):
+        latest_key = sorted(journeys.keys())[-1]
+        latest_meta = journeys[latest_key].get("metadata", {})
+        return {
+            "busId": bus_id,
+            "journeyKey": latest_key,
+            "departureDate": latest_meta.get("departureDate"),
+            "status": latest_meta.get("status", "COMPLETED"),
+            "actualArrival": latest_meta.get("actualArrival")
+        }
+        
+    return {
+        "busId": bus_id,
+        "journeyKey": None,
+        "departureDate": None,
+        "status": "UNKNOWN",
+        "actualArrival": None
+    }
 
 @app.get("/api/history")
 async def history():
