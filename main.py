@@ -573,9 +573,21 @@ async def process_stop_detection(
     route_points = route_points_cache[route_key]
 
     print(
-        f"[ROUTE POINTS] "
-        f"{len(route_points)} loaded"
+        f"[ROUTE DEBUG] "
+        f"route={route}"
     )
+
+    print(
+        f"[ROUTE KEY] "
+        f"{route_key}"
+    )
+
+    print(
+        f"[ROUTE POINT COUNT] "
+        f"{len(route_points)}"
+    )
+
+    print(f"[AVAILABLE ROUTES] {list(route_points_cache.keys())}")
 
     for index, stop in enumerate(route_points):
         stop_name = stop.get(
@@ -773,7 +785,12 @@ async def websocket_listener(service_no, ws_url, ws_port, doj, default_vehicle_n
 
     while True:
         try:
-            async with websockets.connect(endpoint, ping_interval=30, ping_timeout=10) as websocket:
+            async with websockets.connect(
+                endpoint,
+                ping_interval=30,
+                ping_timeout=10
+            ) as websocket:
+                print(f"[CONNECTED] {service_no}")
                 # Subscription Payload
                 sub_msg = {
                     "serviceNo": service_no,
@@ -786,11 +803,35 @@ async def websocket_listener(service_no, ws_url, ws_port, doj, default_vehicle_n
                 # WebSocket receive loop
                 async for message in websocket:
                     try:
+                        print(f"[RAW WS] {message[:1000]}")
+
                         msg_data = json.loads(message)
+
+                        print(f"[WS KEYS] {list(msg_data.keys())}")
+
                         vehicle_info = msg_data.get("vehicleInfo", {})
+                        print(f"[VEHICLE INFO KEYS] {list(vehicle_info.keys())}")
+
                         position = vehicle_info.get("position", {})
+                        print(f"[POSITION] {position}")
+
                         lat = position.get("latitude")
                         lng = position.get("longitude")
+
+                        # Alternate formats
+                        if lat is None:
+                            lat = position.get("lat")
+
+                        if lng is None:
+                            lng = position.get("lng")
+
+                        if lat is None:
+                            lat = vehicle_info.get("latitude")
+
+                        if lng is None:
+                            lng = vehicle_info.get("longitude")
+
+                        print(f"[GPS EXTRACTED] lat={lat} lng={lng}")
                         
                         if lat is not None and lng is not None:
                             veh_no = vehicle_info.get("vehicleNumber") or vehicle_info.get("vehicleNum") or default_vehicle_no or ""
@@ -811,7 +852,18 @@ async def websocket_listener(service_no, ws_url, ws_port, doj, default_vehicle_n
                             }
                             
                             print(f"[MARKER UPDATE] GPS update: {service_no} => {lat}, {lng}")
-                            await process_stop_detection(service_no, float(lat), float(lng), doj)
+                            await process_stop_detection(
+                                service_no,
+                                float(lat),
+                                float(lng),
+                                doj
+                            )
+
+                            print(
+                                f"[STOP DETECTOR CALLED] "
+                                f"{service_no} "
+                                f"{lat},{lng}"
+                            )
                             
                     except Exception as e:
                         print(f"[WEBSOCKET ERROR] Message parsing failed: {e}")
@@ -843,13 +895,13 @@ async def stale_bus_checker():
 
                 inactive_time = now - last_seen
 
-                if inactive_time > 300:
+                if inactive_time > 1800:
                     print(
                         f"[SCHEDULER] "
                         f"{bus_id} inactive "
                         f"for "
                         f"{inactive_time:.1f}s "
-                        f"(>300s)"
+                        f"(>1800s)"
                     )
                     remove_buses.append(
                         bus_id
