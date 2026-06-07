@@ -114,10 +114,13 @@ def auto_fill_previous_stops(
 # Structure: { service_no: { lat, lng, serviceNo, vehicleNo, operator, lastSeenTime, status } }
 live_buses = {}
 recorded_stops = {}
+provider_stop_statuses = {}
+live_bus_locations = {}
 buses_cache = {}
 active_journeys_cache = {}
 route_points_cache = {}
 initialized_journeys = set()
+
 
 # Active tracking WebSocket task registry
 # Structure: { service_no: asyncio.Task }
@@ -490,6 +493,196 @@ def calculate_delay_with_journey_date(
         return 0, "On Time"
 
 # ======================================================
+# PROVIDER STOP DETECTION (V3)
+# ======================================================
+
+def auto_build_route_from_provider(bus_id, positions, journey_key):
+    """
+    Auto-build intermediateStops from provider positions data.
+    Writes to journeys/{bus_id}/{journey_key}/providerStops
+    """
+    stops = []
+    for pos in positions:
+        stops.append({
+            "name": pos.get("name", ""),
+            "scheduled": pos.get("scheduleTime", ""),
+            "providerStatus": pos.get("status", "")
+        })
+    try:
+        db.reference(f"journeys/{bus_id}/{journey_key}/providerStops").set(stops)
+        print(f"[AUTO BUILD ROUTE] Wrote {len(stops)} stops to providerStops for {bus_id}")
+    except Exception as e:
+        print(f"[AUTO BUILD ROUTE ERROR] {e}")
+
+def record_provider_stop(bus_id, journey_key, stop_name, scheduled_time, 
+                          journey_date, departure_time_str, is_first_message_missed=False):
+    stop_key = stop_name.replace(" ", "_")
+    
+    if bus_id not in recorded_stops:
+        recorded_stops[bus_id] = set()
+    
+    if stop_key in recorded_stops[bus_id]:
+        return  # Already recorded
+    
+    if is_first_message_missed:
+        # Auto-fill past stops with scheduled time and 0 delay
+        try:
+            db.reference(f"journeys/{bus_id}/{journey_key}/actualTimes/{stop_key}").set({
+                "scheduled": scheduled_time,
+                "actual": scheduled_time,
+                "actualTimestamp": int(time.time()),
+                "delayMinutes": 0,
+                "status": "Passed",
+                "recordedAt": int(time.time()),
+                "source": "provider_autofill"
+            })
+            print(f"[STOP AUTO-FILL RECORDED] {bus_id}: {stop_name} set to scheduled={scheduled_time}")
+        except Exception as e:
+            print(f"[STOP AUTO-FILL RECORDED ERROR] {e}")
+    else:
+        actual_dt = datetime.now(IST)
+        actual_time = actual_dt.strftime("%I:%M %p")
+        actual_timestamp = int(actual_dt.timestamp())
+        
+        delay_minutes, status = calculate_delay_with_journey_date(
+            journey_date, departure_time_str, scheduled_time, actual_timestamp
+        )
+        
+        try:
+            db.reference(f"journeys/{bus_id}/{journey_key}/actualTimes/{stop_key}").set({
+                "scheduled": scheduled_time,
+                "actual": actual_time,
+                "actualTimestamp": actual_timestamp,
+                "delayMinutes": delay_minutes,
+                "status": status,
+                "recordedAt": actual_timestamp,
+                "source": "provider"
+            })
+            print(f"[STOP ARRIVED PROVIDER] {bus_id}: {stop_name} | delay={delay_minutes} status={status}")
+        except Exception as e:
+            print(f"[STOP ARRIVE RECORDED ERROR] {e}")
+    
+    recorded_stops[bus_id].add(stop_key)
+
+async def process_provider_stops(bus_id, positions, journey_date, journey_key, departure_time_str):
+    if not positions:
+        return
+
+    # 1. Initialize caches for this bus
+    is_first_msg = False
+    if bus_id not in provider_stop_statuses:
+        provider_stop_statuses[bus_id] = {}
+        is_first_msg = True
+        
+    if bus_id not in recorded_stops:
+        try:
+            actual_times_existing = db.reference(f"journeys/{bus_id}/{journey_key}/actualTimes").get() or {}
+            recorded_stops[bus_id] = set(actual_times_existing.keys())
+        except Exception as e:
+            print(f"[CACHE STOP ERROR] {e}")
+            recorded_stops[bus_id] = set()
+
+    # 2. Check if providerStops exists in Firebase, if not, auto build
+    journey_init_key = f"{bus_id}_{journey_key}_providerStops"
+    if journey_init_key not in initialized_journeys:
+        auto_build_route_from_provider(bus_id, positions, journey_key)
+        initialized_journeys.add(journey_init_key)
+
+    # 3. Analyze status transitions and current statuses
+    prev_statuses = provider_stop_statuses[bus_id]
+    
+    last_passed = None
+    next_stop = None
+    
+    for pos in positions:
+        stop_name = pos.get("name")
+        status = pos.get("status")
+        scheduled_time = pos.get("scheduleTime")
+        
+        if not stop_name:
+            continue
+            
+        stop_key = stop_name.replace(" ", "_")
+        prev_status = prev_statuses.get(stop_name)
+        
+        if status in ["MISSED", "PASSED"]:
+            last_passed = stop_name
+        elif status == "NEXT":
+            next_stop = stop_name
+            
+        should_record = False
+        is_first_message_missed = False
+        
+        if prev_status == "NEXT" and status in ["MISSED", "PASSED"]:
+            should_record = True
+            print(f"[STOP TRANSITION] {bus_id}: {stop_name} transitioned from NEXT to {status}")
+        elif status in ["MISSED", "PASSED"] and stop_key not in recorded_stops.get(bus_id, set()):
+            should_record = True
+            if is_first_msg or prev_status is None:
+                is_first_message_missed = True
+                print(f"[STOP AUTO-FILL] {bus_id}: {stop_name} was already {status} when tracking started")
+            else:
+                print(f"[STOP INITIAL DETECTION] {bus_id}: {stop_name} is {status} (not previously recorded)")
+            
+        if should_record:
+            record_provider_stop(
+                bus_id=bus_id,
+                journey_key=journey_key,
+                stop_name=stop_name,
+                scheduled_time=scheduled_time,
+                journey_date=journey_date,
+                departure_time_str=departure_time_str,
+                is_first_message_missed=is_first_message_missed
+            )
+            
+        prev_statuses[stop_name] = status
+
+    # Update live_buses in-memory details
+    if bus_id in live_buses:
+        if last_passed:
+            live_buses[bus_id]["lastPassedStop"] = last_passed
+        if next_stop:
+            live_buses[bus_id]["nextStop"] = next_stop
+        live_buses[bus_id]["providerStopCount"] = len(positions)
+        
+        # Update activeJourneys in Firebase
+        try:
+            update_data = {}
+            if last_passed:
+                update_data["lastPassedStop"] = last_passed
+            if next_stop:
+                update_data["nextStop"] = next_stop
+            if update_data:
+                db.reference(f"activeJourneys/{bus_id}").update(update_data)
+        except Exception as e:
+            print(f"[FIREBASE UPDATE ERROR] activeJourneys update failed: {e}")
+
+    # Complete journey if last stop in provider positions is MISSED or PASSED
+    if positions and positions[-1].get("status") in ["MISSED", "PASSED"]:
+        is_completed_in_mem = live_buses.get(bus_id, {}).get("trip_completed", False)
+        if not is_completed_in_mem:
+            actual_arrival_dt = datetime.now(IST).strftime("%Y-%m-%d %I:%M %p")
+            actual_arrival_ts = int(time.time())
+            print(f"[FINAL STOP REACHED (PROVIDER)] Recording actual arrival for {bus_id}: {actual_arrival_dt}")
+            
+            try:
+                db.reference(f"journeys/{bus_id}/{journey_key}/metadata").update({
+                    "actualArrival": actual_arrival_dt,
+                    "actualArrivalTimestamp": actual_arrival_ts,
+                    "status": "COMPLETED"
+                })
+                
+                db.reference(f"activeJourneys/{bus_id}").update({
+                    "status": "COMPLETED",
+                    "completedAt": actual_arrival_ts
+                })
+                
+                if bus_id in live_buses:
+                    live_buses[bus_id]["trip_completed"] = True
+            except Exception as e:
+                print(f"[FINAL STOP PROVIDER ERROR] {e}")
+
+# ======================================================
 # STOP DETECTION
 # ======================================================
 
@@ -686,23 +879,13 @@ async def process_stop_detection(
             f"journeys/{bus_id}/{journey_key}/actualTimes/{stop_key}"
         )
         actual_ref.set({
-            "scheduled":
-            scheduled_time,
-
-            "actual":
-            actual_time,
-
-            "actualTimestamp":
-            actual_timestamp,
-
-            "delayMinutes":
-            delay_minutes,
-
-            "status":
-            status,
-
-            "recordedAt":
-            actual_timestamp
+            "scheduled": scheduled_time,
+            "actual": actual_time,
+            "actualTimestamp": actual_timestamp,
+            "delayMinutes": delay_minutes,
+            "status": status,
+            "recordedAt": actual_timestamp,
+            "source": "gps_fallback"
         })
         recorded_stops[bus_id].add(stop_key)
 
@@ -858,37 +1041,66 @@ async def websocket_listener(service_no, ws_url, ws_port, doj, default_vehicle_n
 
                         print(f"[GPS EXTRACTED] lat={lat} lng={lng}")
                         
+                        veh_no = vehicle_info.get("vehicleNumber") or vehicle_info.get("vehicleNum") or default_vehicle_no or ""
+                        existing = live_buses.get(service_no, {})
+                        
+                        lat_val = float(lat) if lat is not None else existing.get("lat")
+                        lng_val = float(lng) if lng is not None else existing.get("lng")
+                        status_val = "live" if lat_val is not None else "waiting"
+                        
+                        live_buses[service_no] = {
+                            "lat": lat_val,
+                            "lng": lng_val,
+                            "serviceNo": service_no,
+                            "vehicleNo": veh_no,
+                            "operator": op_name,
+                            "lastSeenTime": datetime.now(),
+                            "last_seen": time.time(),
+                            "status": status_val,
+                            "journeyKey": journey_key,
+                            "trip_completed": existing.get("trip_completed", False),
+                            "nextStop": existing.get("nextStop"),
+                            "lastPassedStop": existing.get("lastPassedStop"),
+                            "providerStopCount": existing.get("providerStopCount", 0)
+                        }
+                        
                         if lat is not None and lng is not None:
-                            veh_no = vehicle_info.get("vehicleNumber") or vehicle_info.get("vehicleNum") or default_vehicle_no or ""
-                            
-                            # Update in-memory coordinates
-                            existing = live_buses.get(service_no, {})
-                            live_buses[service_no] = {
-                                "lat": float(lat),
-                                "lng": float(lng),
-                                "serviceNo": service_no,
-                                "vehicleNo": veh_no,
-                                "operator": op_name,
-                                "lastSeenTime": datetime.now(),
-                                "last_seen": time.time(),
-                                "status": "live",
-                                "journeyKey": journey_key,
-                                "trip_completed": existing.get("trip_completed", False)
-                            }
-                            
                             print(f"[MARKER UPDATE] GPS update: {service_no} => {lat}, {lng}")
-                            await process_stop_detection(
-                                service_no,
-                                float(lat),
-                                float(lng),
-                                doj
+                        
+                        # === PROVIDER STOP DETECTION (PRIMARY) ===
+                        positions = msg_data.get("positions", [])
+                        if not positions:
+                            positions = vehicle_info.get("positions", [])
+                            
+                        if positions and len(positions) > 0:
+                            await process_provider_stops(
+                                bus_id=service_no,
+                                positions=positions,
+                                journey_date=doj,
+                                journey_key=journey_key,
+                                departure_time_str=departure_time_str
                             )
-
-                            print(
-                                f"[STOP DETECTOR CALLED] "
-                                f"{service_no} "
-                                f"{lat},{lng}"
-                            )
+                        else:
+                            # === GPS FALLBACK (SECONDARY) ===
+                            if lat is not None and lng is not None:
+                                print(f"[GPS FALLBACK] {service_no} — no provider stops, using radius detection")
+                                await process_stop_detection(
+                                    service_no,
+                                    float(lat),
+                                    float(lng),
+                                    doj
+                                )
+                                
+                            # Update RAM cache for live-tracking endpoint from GPS messages
+                            if lat is not None and lng is not None:
+                                updated_existing = live_buses.get(service_no, {})
+                                live_bus_locations[service_no] = {
+                                    "lat": float(lat),
+                                    "lng": float(lng),
+                                    "currentStop": updated_existing.get("lastPassedStop") or "",
+                                    "nextStop": updated_existing.get("nextStop") or "",
+                                    "lastSeen": int(time.time())
+                                }
                             
                     except Exception as e:
                         print(f"[WEBSOCKET ERROR] Message parsing failed: {e}")
@@ -1193,10 +1405,78 @@ async def get_live():
             "arrivalTime": matched_bus.get("arrivalTime", ""),
             "intermediateStops": matched_bus.get("intermediateStops", []),
             "stopTimes": matched_bus.get("stopTimes", []),
-            "type": matched_bus.get("type", "")
+            "type": matched_bus.get("type", ""),
+            "nextStop": data.get("nextStop") if data else active_info.get("nextStop"),
+            "lastPassedStop": data.get("lastPassedStop") if data else active_info.get("lastPassedStop"),
+            "providerStopCount": data.get("providerStopCount") if data else 0,
         }
 
     return formatted
+
+@app.get("/api/live-track/{bus_id}")
+async def live_track(bus_id: str):
+    data = live_bus_locations.get(bus_id)
+    
+    # Fetch provider stops from active journey
+    provider_stops = []
+    active_info = active_journeys_cache.get(bus_id) or db.reference(f"activeJourneys/{bus_id}").get() or {}
+    if active_info:
+        journey_key = active_info.get("journeyKey")
+        if journey_key:
+            provider_stops = db.reference(f"journeys/{bus_id}/{journey_key}/providerStops").get() or []
+            
+    if not data:
+        return {
+            "lat": None,
+            "lng": None,
+            "currentStop": active_info.get("lastPassedStop"),
+            "nextStop": active_info.get("nextStop"),
+            "lastSeen": None,
+            "providerStops": provider_stops
+        }
+    return {
+        "lat": data.get("lat"),
+        "lng": data.get("lng"),
+        "currentStop": data.get("currentStop") or active_info.get("lastPassedStop"),
+        "nextStop": data.get("nextStop") or active_info.get("nextStop"),
+        "lastSeen": data.get("lastSeen"),
+        "providerStops": provider_stops
+    }
+
+@app.get("/api/route-points/{bus_id}")
+async def route_points_endpoint(bus_id: str):
+    buses = buses_cache or db.reference("buses").get() or {}
+    matched_bus = None
+    for _, bus in buses.items():
+        link = bus.get("link")
+        if link:
+            extracted = extract_service_no_from_url(link)
+            if extracted and extracted.upper() == bus_id.upper():
+                matched_bus = bus
+                break
+        operator = bus.get("op", "").split()[0].upper()
+        if operator and operator in bus_id.upper():
+            matched_bus = bus
+            break
+            
+    if not matched_bus:
+        return []
+        
+    route = matched_bus.get("route", "")
+    if not route:
+        return []
+        
+    route_key = route.lower().replace(" - ", "___").replace(" ", "_")
+    points = db.reference(f"routePoints/{route_key}").get() or []
+    
+    formatted_points = []
+    for pt in points:
+        formatted_points.append({
+            "name": pt.get("name", ""),
+            "lat": pt.get("lat"),
+            "lng": pt.get("lng")
+        })
+    return formatted_points
 
 @app.get("/api/actual-times")
 async def actual_times(bus_id: str = None):
