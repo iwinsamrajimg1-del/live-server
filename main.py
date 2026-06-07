@@ -815,6 +815,25 @@ async def websocket_listener(service_no, ws_url, ws_port, doj, default_vehicle_n
 
                         print(f"[WS KEYS] {list(msg_data.keys())}")
 
+                        # ========== PROVIDER POSITIONS LOGGING ==========
+                        positions = msg_data.get("positions", [])
+                        if not positions:
+                            positions = msg_data.get("vehicleInfo", {}).get("positions", [])
+
+                        if positions:
+                            print("\n========== PROVIDER POSITIONS ==========")
+                            for pos in positions:
+                                print(
+                                    f"STOP={pos.get('name')} | "
+                                    f"STATUS={pos.get('status')} | "
+                                    f"SCHEDULE={pos.get('scheduleTime')} | "
+                                    f"ETA={pos.get('estimatedTime')}"
+                                )
+                            print("========================================\n")
+                        else:
+                            print(f"[PROVIDER] No positions array in message")
+                        # ================================================
+
                         vehicle_info = msg_data.get("vehicleInfo", {})
                         print(f"[VEHICLE INFO KEYS] {list(vehicle_info.keys())}")
 
