@@ -1415,11 +1415,23 @@ async def get_live():
 
 @app.get("/api/live-track/{bus_id}")
 async def live_track(bus_id: str):
-    data = live_bus_locations.get(bus_id)
-    
-    # Fetch provider stops from active journey
+    # Case-insensitive RAM lookups
+    data = None
+    for k, v in live_bus_locations.items():
+        if k.upper() == bus_id.upper():
+            data = v
+            break
+
+    active_info = None
+    for k, v in active_journeys_cache.items():
+        if k.upper() == bus_id.upper():
+            active_info = v
+            break
+            
+    if not active_info:
+        active_info = db.reference(f"activeJourneys/{bus_id}").get() or {}
+        
     provider_stops = []
-    active_info = active_journeys_cache.get(bus_id) or db.reference(f"activeJourneys/{bus_id}").get() or {}
     if active_info:
         journey_key = active_info.get("journeyKey")
         if journey_key:
