@@ -124,6 +124,7 @@ initialized_journeys = set()
 main_loop = None
 tracking_tasks = {}
 firebase_listener_started = False
+STALE_TIMEOUT = 1800
 
 # ======================================================
 # HTML PARSER & SCRAPER
@@ -791,6 +792,11 @@ async def websocket_listener(service_no, ws_url, ws_port, doj, default_vehicle_n
                 ping_timeout=10
             ) as websocket:
                 print(f"[CONNECTED] {service_no}")
+                print(
+                    f"[SUBSCRIBE] "
+                    f"service={service_no} "
+                    f"doj={doj}"
+                )
                 # Subscription Payload
                 sub_msg = {
                     "serviceNo": service_no,
@@ -895,13 +901,13 @@ async def stale_bus_checker():
 
                 inactive_time = now - last_seen
 
-                if inactive_time > 1800:
+                if inactive_time > STALE_TIMEOUT:
                     print(
                         f"[SCHEDULER] "
                         f"{bus_id} inactive "
                         f"for "
                         f"{inactive_time:.1f}s "
-                        f"(>1800s)"
+                        f"(>{STALE_TIMEOUT}s)"
                     )
                     remove_buses.append(
                         bus_id
@@ -1002,12 +1008,24 @@ def start_firebase_bus_listener():
                 page_data = fetch_and_parse_tracking_page(tracking_link)
                 
                 if page_data:
-                    # Recover DOJ if activeJourneys exists
-                    active_info = active_journeys_cache.get(service_no)
-                    doj = page_data["doj"]
-                    if active_info and isinstance(active_info, dict) and active_info.get("journeyDate"):
-                        doj = active_info["journeyDate"]
-                        print(f"[RECOVERY] Recovered active journey date {doj} for {service_no}")
+                    page_doj = page_data.get("doj")
+                    active_ref = db.reference("activeJourneys")
+                    active_journey = active_ref.child(service_no).get()
+
+                    if active_journey:
+                        recovered_doj = active_journey.get("journeyDate")
+
+                        if recovered_doj == page_doj:
+                            doj = recovered_doj
+                        else:
+                            print(
+                                f"[DOJ MISMATCH] {service_no} "
+                                f"Firebase={recovered_doj} "
+                                f"Page={page_doj}"
+                            )
+                            doj = page_doj
+                    else:
+                        doj = page_doj
 
                     future = asyncio.run_coroutine_threadsafe(
                         websocket_listener(
