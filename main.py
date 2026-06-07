@@ -1415,27 +1415,35 @@ async def get_live():
 
 @app.get("/api/live-track/{bus_id}")
 async def live_track(bus_id: str):
-    # Case-insensitive RAM lookups
+    import urllib.parse
+    bus_id_clean = urllib.parse.unquote(bus_id).replace("%20", " ").strip().upper()
+    
+    # Case-insensitive RAM lookups with space & encoding normalization
     data = None
     for k, v in live_bus_locations.items():
-        if k.upper() == bus_id.upper():
+        k_clean = urllib.parse.unquote(k).replace("%20", " ").strip().upper()
+        if k_clean == bus_id_clean:
             data = v
             break
 
     active_info = None
     for k, v in active_journeys_cache.items():
-        if k.upper() == bus_id.upper():
+        k_clean = urllib.parse.unquote(k).replace("%20", " ").strip().upper()
+        if k_clean == bus_id_clean:
             active_info = v
             break
             
     if not active_info:
-        active_info = db.reference(f"activeJourneys/{bus_id}").get() or {}
+        active_info = db.reference(f"activeJourneys/{bus_id_clean}").get() or {}
+        if not active_info and "%" in bus_id:
+            unquoted_id = urllib.parse.unquote(bus_id).strip()
+            active_info = db.reference(f"activeJourneys/{unquoted_id}").get() or {}
         
     provider_stops = []
     if active_info:
         journey_key = active_info.get("journeyKey")
         if journey_key:
-            provider_stops = db.reference(f"journeys/{bus_id}/{journey_key}/providerStops").get() or []
+            provider_stops = db.reference(f"journeys/{active_info.get('serviceNo') or bus_id_clean}/{journey_key}/providerStops").get() or []
             
     if not data:
         return {
@@ -1457,17 +1465,22 @@ async def live_track(bus_id: str):
 
 @app.get("/api/route-points/{bus_id}")
 async def route_points_endpoint(bus_id: str):
+    import urllib.parse
+    bus_id_clean = urllib.parse.unquote(bus_id).replace("%20", " ").strip().upper()
+    
     buses = buses_cache or db.reference("buses").get() or {}
     matched_bus = None
     for _, bus in buses.items():
         link = bus.get("link")
         if link:
             extracted = extract_service_no_from_url(link)
-            if extracted and extracted.upper() == bus_id.upper():
-                matched_bus = bus
-                break
+            if extracted:
+                extracted_clean = urllib.parse.unquote(extracted).replace("%20", " ").strip().upper()
+                if extracted_clean == bus_id_clean:
+                    matched_bus = bus
+                    break
         operator = bus.get("op", "").split()[0].upper()
-        if operator and operator in bus_id.upper():
+        if operator and operator in bus_id_clean:
             matched_bus = bus
             break
             
