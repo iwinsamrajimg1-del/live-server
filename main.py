@@ -1017,27 +1017,34 @@ async def websocket_listener(service_no, ws_url, ws_port, doj, default_vehicle_n
                             print(f"[PROVIDER] No positions array in message")
                         # ================================================
 
-                        vehicle_info = msg_data.get("vehicleInfo", {})
-                        print(f"[VEHICLE INFO KEYS] {list(vehicle_info.keys())}")
-
-                        position = vehicle_info.get("position", {})
-                        print(f"[POSITION] {position}")
-
-                        lat = position.get("latitude")
-                        lng = position.get("longitude")
-
-                        # Alternate formats
-                        if lat is None:
-                            lat = position.get("lat")
-
-                        if lng is None:
-                            lng = position.get("lng")
-
-                        if lat is None:
-                            lat = vehicle_info.get("latitude")
-
-                        if lng is None:
-                            lng = vehicle_info.get("longitude")
+                        # Robust GPS extraction from various possible structures
+                        vehicle_info = msg_data.get("vehicleInfo") or {}
+                        if not isinstance(vehicle_info, dict):
+                            vehicle_info = {}
+                        position = vehicle_info.get("position") or msg_data.get("position") or {}
+                        if not isinstance(position, dict):
+                            position = {}
+                            
+                        lat = position.get("latitude") or position.get("lat")
+                        lng = position.get("longitude") or position.get("lng")
+                        
+                        if lat is None or lng is None:
+                            lat = vehicle_info.get("latitude") or vehicle_info.get("lat")
+                            lng = vehicle_info.get("longitude") or vehicle_info.get("lng")
+                            
+                        if lat is None or lng is None:
+                            lat = msg_data.get("latitude") or msg_data.get("lat")
+                            lng = msg_data.get("longitude") or msg_data.get("lng")
+                            
+                        if lat is None or lng is None:
+                            # Try nested location dicts
+                            for loc_key in ["location", "vehicleLocation", "lastLocation", "liveTracking"]:
+                                loc = msg_data.get(loc_key) or vehicle_info.get(loc_key) or position.get(loc_key)
+                                if isinstance(loc, dict):
+                                    lat = loc.get("lat") or loc.get("latitude")
+                                    lng = loc.get("lng") or loc.get("longitude")
+                                    if lat is not None and lng is not None:
+                                        break
 
                         print(f"[GPS EXTRACTED] lat={lat} lng={lng}")
                         
@@ -1282,6 +1289,14 @@ def start_firebase_bus_listener():
                             "lastSeenTime": datetime.now(),
                             "status": "live" if (page_data["lat"] is not None and page_data["lng"] is not None) else "waiting"
                         }
+                    if page_data["lat"] is not None and page_data["lng"] is not None:
+                        live_bus_locations[service_no] = {
+                            "lat": float(page_data["lat"]),
+                            "lng": float(page_data["lng"]),
+                            "currentStop": "",
+                            "nextStop": "",
+                            "lastSeen": int(time.time())
+                        }
 
             # Stop tracking and remove memory logs for buses that are no longer configured/active in Firebase
             for service_no in list(tracking_tasks.keys()):
@@ -1445,6 +1460,7 @@ async def live_track(bus_id: str):
         if journey_key:
             provider_stops = db.reference(f"journeys/{active_info.get('serviceNo') or bus_id_clean}/{journey_key}/providerStops").get() or []
             
+    print("LIVE DATA:", data)
     if not data:
         return {
             "lat": None,
