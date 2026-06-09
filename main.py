@@ -254,7 +254,7 @@ def current_date():
         IST
     ).strftime("%Y-%m-%d")
 
-STOP_RADIUS_METERS = 400
+STOP_RADIUS_METERS = 1000
 
 def format_time_24hr(time_str):
     if not time_str:
