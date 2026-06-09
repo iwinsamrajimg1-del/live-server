@@ -515,7 +515,7 @@ def auto_build_route_from_provider(bus_id, positions, journey_key):
         print(f"[AUTO BUILD ROUTE ERROR] {e}")
 
 def record_provider_stop(bus_id, journey_key, stop_name, scheduled_time, 
-                          journey_date, departure_time_str, is_first_message_missed=False):
+                          journey_date, departure_time_str, is_first_message_missed=False, source="provider"):
     stop_key = stop_name.replace(" ", "_")
     
     if bus_id not in recorded_stops:
@@ -556,15 +556,15 @@ def record_provider_stop(bus_id, journey_key, stop_name, scheduled_time,
                 "delayMinutes": delay_minutes,
                 "status": status,
                 "recordedAt": actual_timestamp,
-                "source": "provider"
+                "source": source
             })
-            print(f"[STOP ARRIVED PROVIDER] {bus_id}: {stop_name} | delay={delay_minutes} status={status}")
+            print(f"[STOP ARRIVED PROVIDER ({source})] {bus_id}: {stop_name} | delay={delay_minutes} status={status}")
         except Exception as e:
             print(f"[STOP ARRIVE RECORDED ERROR] {e}")
     
     recorded_stops[bus_id].add(stop_key)
 
-async def process_provider_stops(bus_id, positions, journey_date, journey_key, departure_time_str):
+async def process_provider_stops(bus_id, positions, journey_date, journey_key, departure_time_str, lat=None, lng=None):
     if not positions:
         return
 
@@ -594,7 +594,7 @@ async def process_provider_stops(bus_id, positions, journey_date, journey_key, d
     last_passed = None
     next_stop = None
     
-    for pos in positions:
+    for index, pos in enumerate(positions):
         stop_name = pos.get("name")
         status = pos.get("status")
         scheduled_time = pos.get("scheduleTime")
@@ -605,24 +605,57 @@ async def process_provider_stops(bus_id, positions, journey_date, journey_key, d
         stop_key = stop_name.replace(" ", "_")
         prev_status = prev_statuses.get(stop_name)
         
-        if status in ["MISSED", "PASSED"]:
+        # Check radius-based detection if GPS coordinates are available
+        stop_lat = pos.get("latitude") or pos.get("lat")
+        stop_lng = pos.get("longitude") or pos.get("lng")
+        
+        within_radius = False
+        if lat is not None and lng is not None and stop_lat is not None and stop_lng is not None:
+            try:
+                within, distance = is_stop_reached(
+                    float(lat),
+                    float(lng),
+                    float(stop_lat),
+                    float(stop_lng),
+                    STOP_RADIUS_METERS
+                )
+                if within:
+                    within_radius = True
+                    print(f"[PROVIDER STOP RADIUS DETECTED] {bus_id}: {stop_name} is within radius ({distance:.1f}m)")
+            except Exception as e:
+                print(f"[PROVIDER STOP RADIUS ERROR] {e}")
+                
+        # Determine if stop is passed/crossed
+        is_passed = (status in ["MISSED", "PASSED"]) or (stop_key in recorded_stops.get(bus_id, set())) or within_radius
+        
+        if is_passed:
             last_passed = stop_name
-        elif status == "NEXT":
+        elif next_stop is None:
+            # First stop that is not passed is the next stop
             next_stop = stop_name
             
         should_record = False
         is_first_message_missed = False
+        source_val = "provider"
         
         if prev_status == "NEXT" and status in ["MISSED", "PASSED"]:
             should_record = True
+            source_val = "provider"
             print(f"[STOP TRANSITION] {bus_id}: {stop_name} transitioned from NEXT to {status}")
         elif status in ["MISSED", "PASSED"] and stop_key not in recorded_stops.get(bus_id, set()):
             should_record = True
             if is_first_msg or prev_status is None:
                 is_first_message_missed = True
+                source_val = "provider_autofill"
                 print(f"[STOP AUTO-FILL] {bus_id}: {stop_name} was already {status} when tracking started")
             else:
+                source_val = "provider"
                 print(f"[STOP INITIAL DETECTION] {bus_id}: {stop_name} is {status} (not previously recorded)")
+        elif within_radius and stop_key not in recorded_stops.get(bus_id, set()):
+            should_record = True
+            is_first_message_missed = False
+            source_val = "provider_gps"
+            print(f"[PROVIDER STOP GPS DETECTION] {bus_id}: {stop_name} reached via radius check")
             
         if should_record:
             record_provider_stop(
@@ -632,7 +665,8 @@ async def process_provider_stops(bus_id, positions, journey_date, journey_key, d
                 scheduled_time=scheduled_time,
                 journey_date=journey_date,
                 departure_time_str=departure_time_str,
-                is_first_message_missed=is_first_message_missed
+                is_first_message_missed=is_first_message_missed,
+                source=source_val
             )
             
         prev_statuses[stop_name] = status
@@ -657,8 +691,16 @@ async def process_provider_stops(bus_id, positions, journey_date, journey_key, d
         except Exception as e:
             print(f"[FIREBASE UPDATE ERROR] activeJourneys update failed: {e}")
 
-    # Complete journey if last stop in provider positions is MISSED or PASSED
-    if positions and positions[-1].get("status") in ["MISSED", "PASSED"]:
+    # Complete journey if last stop in provider positions is MISSED or PASSED or recorded
+    is_last_passed = False
+    if positions:
+        last_stop_pos = positions[-1]
+        last_stop_name = last_stop_pos.get("name", "")
+        last_stop_key = last_stop_name.replace(" ", "_")
+        if last_stop_pos.get("status") in ["MISSED", "PASSED"] or last_stop_key in recorded_stops.get(bus_id, set()):
+            is_last_passed = True
+            
+    if is_last_passed:
         is_completed_in_mem = live_buses.get(bus_id, {}).get("trip_completed", False)
         if not is_completed_in_mem:
             actual_arrival_dt = datetime.now(IST).strftime("%Y-%m-%d %I:%M %p")
@@ -1073,6 +1115,24 @@ async def websocket_listener(service_no, ws_url, ws_port, doj, default_vehicle_n
                         
                         if lat is not None and lng is not None:
                             print(f"[MARKER UPDATE] GPS update: {service_no} => {lat}, {lng}")
+                            
+                            # Run GPS-based route stop detection if we have coordinates
+                            await process_stop_detection(
+                                service_no,
+                                float(lat),
+                                float(lng),
+                                doj
+                            )
+                            
+                            # Update RAM cache for live-tracking endpoint from GPS messages
+                            updated_existing = live_buses.get(service_no, {})
+                            live_bus_locations[service_no] = {
+                                "lat": float(lat),
+                                "lng": float(lng),
+                                "currentStop": updated_existing.get("lastPassedStop") or "",
+                                "nextStop": updated_existing.get("nextStop") or "",
+                                "lastSeen": int(time.time())
+                            }
                         
                         # === PROVIDER STOP DETECTION (PRIMARY) ===
                         positions = msg_data.get("positions", [])
@@ -1080,34 +1140,17 @@ async def websocket_listener(service_no, ws_url, ws_port, doj, default_vehicle_n
                             positions = vehicle_info.get("positions", [])
                             
                         if positions and len(positions) > 0:
+                            lat_val = float(lat) if lat is not None else None
+                            lng_val = float(lng) if lng is not None else None
                             await process_provider_stops(
                                 bus_id=service_no,
                                 positions=positions,
                                 journey_date=doj,
                                 journey_key=journey_key,
-                                departure_time_str=departure_time_str
+                                departure_time_str=departure_time_str,
+                                lat=lat_val,
+                                lng=lng_val
                             )
-                        else:
-                            # === GPS FALLBACK (SECONDARY) ===
-                            if lat is not None and lng is not None:
-                                print(f"[GPS FALLBACK] {service_no} — no provider stops, using radius detection")
-                                await process_stop_detection(
-                                    service_no,
-                                    float(lat),
-                                    float(lng),
-                                    doj
-                                )
-                                
-                            # Update RAM cache for live-tracking endpoint from GPS messages
-                            if lat is not None and lng is not None:
-                                updated_existing = live_buses.get(service_no, {})
-                                live_bus_locations[service_no] = {
-                                    "lat": float(lat),
-                                    "lng": float(lng),
-                                    "currentStop": updated_existing.get("lastPassedStop") or "",
-                                    "nextStop": updated_existing.get("nextStop") or "",
-                                    "lastSeen": int(time.time())
-                                }
                             
                     except Exception as e:
                         print(f"[WEBSOCKET ERROR] Message parsing failed: {e}")
