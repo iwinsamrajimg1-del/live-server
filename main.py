@@ -1342,19 +1342,36 @@ def start_firebase_bus_listener():
                         }
 
             # Stop tracking and remove memory logs for buses that are no longer configured/active in Firebase
-            for service_no in list(tracking_tasks.keys()):
+            all_current_tracked = set(tracking_tasks.keys()) | set(live_buses.keys())
+            for service_no in list(all_current_tracked):
                 if service_no not in active_configured_services:
                     print(f"[TRACKING] Stopping tracking for {service_no} (removed/disabled in database)")
-                    try:
-                        tracking_tasks[service_no].cancel()
-                    except Exception:
-                        pass
-                    tracking_tasks.pop(service_no, None)
+                    if service_no in tracking_tasks:
+                        try:
+                            tracking_tasks[service_no].cancel()
+                        except Exception:
+                            pass
+                        tracking_tasks.pop(service_no, None)
                     live_buses.pop(service_no, None)
                     recorded_stops.pop(service_no, None)
+                    try:
+                        db.reference(f"activeJourneys/{service_no}").delete()
+                        print(f"[TRACKING] Deleted activeJourneys/{service_no} from Firebase")
+                    except Exception as e:
+                        print(f"[FIREBASE DELETE ERROR] Failed to delete activeJourneys/{service_no}: {e}")
                     to_remove = [k for k in initialized_journeys if k.startswith(f"{service_no}_")]
                     for k in to_remove:
                         initialized_journeys.discard(k)
+
+            # Clean up activeJourneys database path for any service that is no longer configured
+            try:
+                active_journeys = db.reference("activeJourneys").get() or {}
+                for service_no in list(active_journeys.keys()):
+                    if service_no.upper() not in {s.upper() for s in active_configured_services}:
+                        print(f"[TRACKING CLEANUP] Removing orphaned active journey {service_no} from Firebase")
+                        db.reference(f"activeJourneys/{service_no}").delete()
+            except Exception as e:
+                print(f"[TRACKING CLEANUP ERROR] Failed to clean up activeJourneys: {e}")
         except Exception as e:
             print("[FIREBASE LISTENER ERROR]", str(e))
 
@@ -1414,7 +1431,19 @@ async def get_live():
     configured_buses = buses_cache or db.reference("buses").get() or {}
     active_journeys = db.reference("activeJourneys").get() or {}
     
+    # Determine active configured service numbers
+    active_configured_services = set()
+    for bus_key, bus in configured_buses.items():
+        if is_tracking_enabled(bus):
+            link = bus.get("link", "")
+            if link:
+                service_no = extract_service_no_from_url(link)
+                if service_no:
+                    active_configured_services.add(service_no.upper())
+    
     all_bus_ids = set(live_buses.keys()) | set(active_journeys.keys())
+    # Filter to only keep active configured services
+    all_bus_ids = {bid for bid in all_bus_ids if bid.upper() in active_configured_services}
 
     for bus_id in all_bus_ids:
         data = live_buses.get(bus_id)
