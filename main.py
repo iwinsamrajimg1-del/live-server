@@ -344,9 +344,9 @@ def update_journey_status():
             # If status is already marked COMPLETED (e.g. by final stop arrival), we keep it COMPLETED
             if status == "COMPLETED":
                 new_status = "COMPLETED"
-            elif now < departure_dt:
+            elif now < (departure_dt - timedelta(hours=1)):
                 new_status = "WAITING"
-            elif departure_dt <= now <= (arrival_dt + timedelta(hours=3)):
+            elif (departure_dt - timedelta(hours=1)) <= now <= (arrival_dt + timedelta(hours=3)):
                 new_status = "LIVE"
             else:
                 new_status = "COMPLETED"
@@ -379,9 +379,9 @@ def init_journey_metadata(bus_id, journey_date, departure_time_str, matched_bus=
                 arrival_dt = parse_datetime(journey_date, arrival_time_str)
                 if arrival_dt < departure_dt:
                     arrival_dt += timedelta(days=1)
-                if now < departure_dt:
+                if now < (departure_dt - timedelta(hours=1)):
                     status = "WAITING"
-                elif departure_dt <= now <= (arrival_dt + timedelta(hours=3)):
+                elif (departure_dt - timedelta(hours=1)) <= now <= (arrival_dt + timedelta(hours=3)):
                     status = "LIVE"
                 else:
                     status = "COMPLETED"
