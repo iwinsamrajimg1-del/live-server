@@ -276,6 +276,20 @@ def parse_datetime(date_str, time_str):
     dt = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %I:%M %p")
     return dt.replace(tzinfo=IST)
 
+def get_route_key(route):
+    if not route:
+        return ""
+    clean_route = re.sub(r'[^a-z0-9]', '', route.lower())
+    try:
+        route_keys = db.reference("routePoints").get(shallow=True) or {}
+        for r_key in route_keys:
+            clean_key = re.sub(r'[^a-z0-9]', '', r_key.lower())
+            if clean_key == clean_route:
+                return r_key
+    except Exception as e:
+        print(f"[ROUTE KEY MATCH ERROR] {e}")
+    return route.lower().replace(" - ", "___").replace(" ", "_")
+
 def get_journey_ref(bus_id, journey_key):
     return db.reference(f"journeys/{bus_id}/{journey_key}")
 
@@ -792,11 +806,7 @@ async def process_stop_detection(
         ""
     )
 
-    route_key = (
-        route.lower()
-        .replace(" - ", "___")
-        .replace(" ", "_")
-    )
+    route_key = get_route_key(route)
 
     if route_key not in route_points_cache:
         route_points_ref = db.reference(
@@ -1579,7 +1589,7 @@ async def route_points_endpoint(bus_id: str):
     if not route:
         return []
         
-    route_key = route.lower().replace(" - ", "___").replace(" ", "_")
+    route_key = get_route_key(route)
     points = db.reference(f"routePoints/{route_key}").get() or []
     
     formatted_points = []
