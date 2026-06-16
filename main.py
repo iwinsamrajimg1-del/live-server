@@ -12,7 +12,13 @@ import re
 import urllib.request
 import threading
 import time
+import logging
 from stop_detector import is_stop_reached
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("winbus-tracker")
+
 
 # ======================================================
 # APP
@@ -320,11 +326,31 @@ def get_journey_ref(bus_id, journey_key):
 def get_journey_cache_key(bus_id, journey_key):
     return f"{bus_id}::{journey_key}"
 
-def finalize_journey(bus_id, journey_key, journey_date, completed_at=None):
+def finalize_journey(bus_id, journey_key, journey_date, completed_at=None, final_stop_reached=False, last_passed=None, final_stop_name=None):
     """Archive and reset a completed journey with one Firebase update."""
     completed_at = int(completed_at or time.time())
     actual_arrival_dt = datetime.fromtimestamp(completed_at, IST)
     actual_arrival = actual_arrival_dt.strftime("%Y-%m-%d %I:%M %p")
+
+    # Resolve names if not passed
+    if last_passed is None or final_stop_name is None:
+        buses = buses_cache or db.reference("buses").get() or {}
+        matched_bus = find_configured_bus(bus_id, buses)
+        if matched_bus:
+            stops = matched_bus.get("intermediateStops") or matched_bus.get("stopTimes") or []
+            if stops:
+                if final_stop_name is None:
+                    final_stop = stops[-1]
+                    final_stop_name = final_stop.get("name") or final_stop.get("stopName") or ""
+        if last_passed is None:
+            if bus_id in live_buses:
+                last_passed = live_buses[bus_id].get("lastPassedStop")
+            if not last_passed:
+                active_info = db.reference(f"activeJourneys/{bus_id}").get() or {}
+                last_passed = active_info.get("lastPassedStop") or ""
+
+    if last_passed and final_stop_name and is_stop_name_match(last_passed, final_stop_name):
+        final_stop_reached = True
 
     journey_ref = get_journey_ref(bus_id, journey_key)
     journey_data = journey_ref.get() or {}
@@ -335,6 +361,9 @@ def finalize_journey(bus_id, journey_key, journey_date, completed_at=None):
         "actualArrival": actual_arrival,
         "actualArrivalTimestamp": completed_at,
         "completedAt": completed_at,
+        "finalStopReached": final_stop_reached,
+        "lastPassedStop": last_passed or "",
+        "finalStopName": final_stop_name or ""
     })
 
     archive = dict(journey_data)
@@ -356,6 +385,13 @@ def finalize_journey(bus_id, journey_key, journey_date, completed_at=None):
         live_buses[bus_id]["status"] = "completed"
         live_buses[bus_id]["nextStop"] = None
     live_bus_locations.pop(bus_id, None)
+    
+    # Standard logger statement
+    logger.info(
+        f"Journey completed: {bus_id} "
+        f"lastPassed={last_passed} "
+        f"finalStop={final_stop_name}"
+    )
     print(f"[JOURNEY COMPLETED] {bus_id} ({journey_key}) archived and reset")
 
 def update_journey_status():
@@ -408,15 +444,36 @@ def update_journey_status():
             if arrival_dt < departure_dt:
                 arrival_dt += timedelta(days=1)
                 
+            # Resolve final stop name and check if it is reached
+            final_stop_reached = False
+            final_stop_name = ""
+            stops = matched_bus.get("intermediateStops") or matched_bus.get("stopTimes") or []
+            last_passed = active_info.get("lastPassedStop") or ""
+            if stops:
+                final_stop = stops[-1]
+                final_stop_name = final_stop.get("name") or final_stop.get("stopName") or ""
+                if last_passed and final_stop_name and is_stop_name_match(last_passed, final_stop_name):
+                    final_stop_reached = True
+
             if now < (departure_dt - timedelta(hours=1)):
                 new_status = "NOT_STARTED"
-            elif (departure_dt - timedelta(hours=1)) <= now <= (arrival_dt + timedelta(hours=3)):
-                new_status = "LIVE"
+            elif (departure_dt - timedelta(hours=1)) <= now <= (arrival_dt + timedelta(hours=12)):
+                if final_stop_reached:
+                    new_status = "COMPLETED"
+                else:
+                    new_status = "LIVE"
             else:
                 new_status = "COMPLETED"
                 
             if new_status == "COMPLETED":
-                finalize_journey(bus_id, journey_key, journey_date)
+                finalize_journey(
+                    bus_id, 
+                    journey_key, 
+                    journey_date, 
+                    final_stop_reached=final_stop_reached,
+                    last_passed=last_passed,
+                    final_stop_name=final_stop_name
+                )
             elif new_status != status:
                 active_ref.child(bus_id).update({"status": new_status})
                 db.reference(f"journeys/{bus_id}/{journey_key}/metadata").update({"status": new_status})
@@ -439,10 +496,28 @@ def init_journey_metadata(bus_id, journey_date, departure_time_str, matched_bus=
                 arrival_dt = parse_datetime(journey_date, arrival_time_str)
                 if arrival_dt < departure_dt:
                     arrival_dt += timedelta(days=1)
+
+                # Resolve final stop name and check if it is reached
+                final_stop_reached = False
+                final_stop_name = ""
+                stops = matched_bus.get("intermediateStops") or matched_bus.get("stopTimes") or []
+                active_info = active_journeys_cache.get(bus_id)
+                if not active_info:
+                    active_info = db.reference(f"activeJourneys/{bus_id}").get() or {}
+                last_passed = active_info.get("lastPassedStop") or ""
+                if stops:
+                    final_stop = stops[-1]
+                    final_stop_name = final_stop.get("name") or final_stop.get("stopName") or ""
+                    if last_passed and final_stop_name and is_stop_name_match(last_passed, final_stop_name):
+                        final_stop_reached = True
+
                 if now < (departure_dt - timedelta(hours=1)):
                     status = "NOT_STARTED"
-                elif (departure_dt - timedelta(hours=1)) <= now <= (arrival_dt + timedelta(hours=3)):
-                    status = "LIVE"
+                elif (departure_dt - timedelta(hours=1)) <= now <= (arrival_dt + timedelta(hours=12)):
+                    if final_stop_reached:
+                        status = "COMPLETED"
+                    else:
+                        status = "LIVE"
                 else:
                     status = "COMPLETED"
             except Exception as e:
