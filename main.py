@@ -326,8 +326,15 @@ def get_journey_ref(bus_id, journey_key):
 def get_journey_cache_key(bus_id, journey_key):
     return f"{bus_id}::{journey_key}"
 
-def finalize_journey(bus_id, journey_key, journey_date, completed_at=None, final_stop_reached=False, last_passed=None, final_stop_name=None):
-    """Archive and reset a completed journey with one Firebase update."""
+def finalize_journey(bus_id, journey_key, journey_date, completed_at=None, final_stop_reached=False, last_passed=None, final_stop_name=None, status_override=None):
+    """Archive and reset a completed journey with one Firebase update.
+
+    status_override: if provided, written as the final metadata/archive status.
+        Pass "STALE" when the tracking window expired before the final stop was
+        confirmed (so the frontend can distinguish lost-tracking from a genuine
+        trip completion).  When None the status is derived from final_stop_reached:
+        True -> "COMPLETED", False -> "STALE".
+    """
     completed_at = int(completed_at or time.time())
     actual_arrival_dt = datetime.fromtimestamp(completed_at, IST)
     actual_arrival = actual_arrival_dt.strftime("%Y-%m-%d %I:%M %p")
@@ -352,12 +359,20 @@ def finalize_journey(bus_id, journey_key, journey_date, completed_at=None, final
     if last_passed and final_stop_name and is_stop_name_match(last_passed, final_stop_name):
         final_stop_reached = True
 
+    # Determine the status to persist.  An explicit override takes precedence;
+    # otherwise use COMPLETED only when the final stop was actually reached, and
+    # STALE when tracking ended before the destination was confirmed.
+    if status_override:
+        final_status = status_override
+    else:
+        final_status = "COMPLETED" if final_stop_reached else "STALE"
+
     journey_ref = get_journey_ref(bus_id, journey_key)
     journey_data = journey_ref.get() or {}
     metadata = dict(journey_data.get("metadata") or {})
     metadata.update({
         "departureDate": journey_date,
-        "status": "COMPLETED",
+        "status": final_status,
         "actualArrival": actual_arrival,
         "actualArrivalTimestamp": completed_at,
         "completedAt": completed_at,
@@ -370,7 +385,7 @@ def finalize_journey(bus_id, journey_key, journey_date, completed_at=None, final
     archive["metadata"] = metadata
     archive["journeyKey"] = journey_key
     archive["journeyDate"] = journey_date
-    archive["status"] = "COMPLETED"
+    archive["status"] = final_status
     archive["completedAt"] = completed_at
 
     db.reference().update({
@@ -382,17 +397,18 @@ def finalize_journey(bus_id, journey_key, journey_date, completed_at=None, final
     active_journeys_cache.pop(bus_id, None)
     if bus_id in live_buses:
         live_buses[bus_id]["trip_completed"] = True
-        live_buses[bus_id]["status"] = "completed"
+        live_buses[bus_id]["status"] = final_status.lower()
         live_buses[bus_id]["nextStop"] = None
     live_bus_locations.pop(bus_id, None)
-    
+
     # Standard logger statement
     logger.info(
-        f"Journey completed: {bus_id} "
+        f"Journey finalized: {bus_id} status={final_status} "
         f"lastPassed={last_passed} "
-        f"finalStop={final_stop_name}"
+        f"finalStop={final_stop_name} "
+        f"finalStopReached={final_stop_reached}"
     )
-    print(f"[JOURNEY COMPLETED] {bus_id} ({journey_key}) archived and reset")
+    print(f"[JOURNEY FINALIZED] {bus_id} ({journey_key}) status={final_status} archived and reset")
 
 def update_journey_status():
     """
@@ -463,16 +479,23 @@ def update_journey_status():
                 else:
                     new_status = "LIVE"
             else:
-                new_status = "COMPLETED"
-                
-            if new_status == "COMPLETED":
+                # Arrival window exceeded.  Only mark COMPLETED when the final
+                # stop was actually reached; otherwise use STALE so the frontend
+                # can distinguish "tracking lost" from a genuine trip completion.
+                if final_stop_reached:
+                    new_status = "COMPLETED"
+                else:
+                    new_status = "STALE"
+
+            if new_status in ("COMPLETED", "STALE"):
                 finalize_journey(
-                    bus_id, 
-                    journey_key, 
-                    journey_date, 
+                    bus_id,
+                    journey_key,
+                    journey_date,
                     final_stop_reached=final_stop_reached,
                     last_passed=last_passed,
-                    final_stop_name=final_stop_name
+                    final_stop_name=final_stop_name,
+                    status_override=new_status,
                 )
             elif new_status != status:
                 active_ref.child(bus_id).update({"status": new_status})
@@ -876,30 +899,57 @@ async def process_provider_stops(bus_id, positions, journey_date, journey_key, d
         except Exception as e:
             print(f"[FIREBASE UPDATE ERROR] activeJourneys update failed: {e}")
 
-    # Complete journey if last stop in provider positions is MISSED or PASSED or recorded
-    is_last_passed = False
-    if positions:
-        last_stop_pos = positions[-1]
-        last_stop_name = last_stop_pos.get("name", "")
-        last_stop_key = last_stop_name.replace(" ", "_")
-        if last_stop_pos.get("status") in ["MISSED", "PASSED"] or last_stop_key in existing_stops:
-            is_last_passed = True
-            
-    if is_last_passed:
-        is_completed_in_mem = live_buses.get(bus_id, {}).get("trip_completed", False)
-        if not is_completed_in_mem:
-            actual_arrival_ts = int(time.time())
-            print(f"[FINAL STOP REACHED (PROVIDER)] Completing {bus_id}")
-            
-            try:
-                finalize_journey(
-                    bus_id,
-                    journey_key,
-                    journey_date,
-                    completed_at=actual_arrival_ts,
+    # Complete the journey only when the provider feed confirms that the bus's
+    # own CONFIGURED final destination has been passed/reached.
+    #
+    # The provider feed is a partial rolling window of nearby stops (e.g. just
+    # 3 entries early in the trip), so positions[-1] is NOT the bus's final
+    # destination.  We must name-match against configured_stops[-1] to avoid
+    # falsely completing the journey minutes after departure.
+    #
+    # If configured_stops is empty we cannot determine the final stop from here;
+    # leave completion to update_journey_status()'s time-window fallback.
+    if configured_stops and positions:
+        final_configured_stop = configured_stops[-1]
+        final_stop_name = (
+            final_configured_stop.get("name")
+            or final_configured_stop.get("stopName")
+            or ""
+        )
+
+        is_last_passed = False
+        for pos in positions:
+            provider_stop_name = pos.get("name", "")
+            provider_status = pos.get("status", "")
+            provider_key = provider_stop_name.replace(" ", "_")
+
+            if final_stop_name and is_stop_name_match(provider_stop_name, final_stop_name):
+                # Found the configured final stop in the provider feed.
+                if provider_status in ["MISSED", "PASSED"] or provider_key in existing_stops:
+                    is_last_passed = True
+                break  # No need to look further once we matched the final stop
+
+        if is_last_passed:
+            is_completed_in_mem = live_buses.get(bus_id, {}).get("trip_completed", False)
+            if not is_completed_in_mem:
+                actual_arrival_ts = int(time.time())
+                print(
+                    f"[FINAL STOP REACHED (PROVIDER)] {bus_id}: "
+                    f"configured final stop '{final_stop_name}' confirmed passed"
                 )
-            except Exception as e:
-                print(f"[FINAL STOP PROVIDER ERROR] {e}")
+                try:
+                    finalize_journey(
+                        bus_id,
+                        journey_key,
+                        journey_date,
+                        completed_at=actual_arrival_ts,
+                        final_stop_reached=True,
+                        last_passed=last_passed,
+                        final_stop_name=final_stop_name,
+                        status_override="COMPLETED",
+                    )
+                except Exception as e:
+                    print(f"[FINAL STOP PROVIDER ERROR] {e}")
 
 # ======================================================
 # STOP DETECTION
@@ -1050,7 +1100,13 @@ async def process_stop_detection(
                 "[SKIP] already recorded (RAM cache)"
             )
             if index == len(route_points) - 1:
-                finalize_journey(bus_id, journey_key, journey_date)
+                finalize_journey(
+                    bus_id,
+                    journey_key,
+                    journey_date,
+                    final_stop_reached=True,
+                    status_override="COMPLETED",
+                )
             continue
 
         scheduled_time = next(
@@ -1128,6 +1184,8 @@ async def process_stop_detection(
                     journey_key,
                     journey_date,
                     completed_at=actual_arrival_ts,
+                    final_stop_reached=True,
+                    status_override="COMPLETED",
                 )
 
 # ======================================================
